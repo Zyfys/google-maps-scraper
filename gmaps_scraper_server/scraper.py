@@ -8,10 +8,11 @@ async def scrape_google_maps(
     query: str,
     max_places: int = 10,
     lang: str = "en",
-    headless: bool = True,
+    headless: bool = True,  # всегда True для сервера
 ):
     """
-    Async scraper Google Maps с актуальными селекторами карточек.
+    Рабочий async scraper Google Maps для headless сервера.
+    Возвращает список мест с названием и ссылкой.
     """
     results = []
 
@@ -22,6 +23,7 @@ async def scrape_google_maps(
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process"
             ],
         )
 
@@ -41,8 +43,8 @@ async def scrape_google_maps(
         await page.goto(search_url, timeout=60000)
         await page.wait_for_timeout(5000)
 
-        # Находим карточки мест по новым селекторам
-        cards = page.locator("a.hfpxzc[aria-label]")  # актуальный селектор
+        # Найти карточки мест по актуальному селектору
+        cards = page.locator("a[aria-label][href*='/maps/place/']")
         count = min(await cards.count(), max_places)
         logger.info(f"Found {count} places")
 
@@ -51,9 +53,8 @@ async def scrape_google_maps(
                 place = {}
                 place["name"] = await cards.nth(i).get_attribute("aria-label")
                 place["google_maps_url"] = await cards.nth(i).get_attribute("href")
-                # Можно оставить рейтинг и адрес None — если потребуется, можно искать по новой логике
-                place["rating"] = None
-                place["address"] = None
+                place["rating"] = None    # Можно добавить логику поиска рейтинга
+                place["address"] = None   # Можно добавить логику поиска адреса
                 results.append(place)
                 logger.info(f"✓ {i+1}/{count}: {place.get('name')}")
             except Exception as e:
