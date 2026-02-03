@@ -1,6 +1,4 @@
-import asyncio
 import logging
-import re
 from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO)
@@ -12,6 +10,9 @@ async def scrape_google_maps(
     lang: str = "en",
     headless: bool = True,
 ):
+    """
+    Async scraper Google Maps с актуальными селекторами карточек.
+    """
     results = []
 
     async with async_playwright() as p:
@@ -40,51 +41,23 @@ async def scrape_google_maps(
         await page.goto(search_url, timeout=60000)
         await page.wait_for_timeout(5000)
 
-        # Скроллим список
-        try:
-            feed = page.locator("div[role='feed']")
-            for _ in range(max_places // 5 + 2):
-                await feed.evaluate("el => el.scrollBy(0, el.scrollHeight)")
-                await page.wait_for_timeout(1500)
-        except:
-            logger.warning("Scroll failed")
-
-        cards = page.locator("a[href*='/maps/place/']")
+        # Находим карточки мест по новым селекторам
+        cards = page.locator("a.hfpxzc[aria-label]")  # актуальный селектор
         count = min(await cards.count(), max_places)
-
         logger.info(f"Found {count} places")
 
         for i in range(count):
             try:
-                await cards.nth(i).click()
-                await page.wait_for_timeout(3000)
-
                 place = {}
-
-                try:
-                    place["name"] = await page.locator("h1").inner_text()
-                except:
-                    place["name"] = None
-
-                try:
-                    rating_text = await page.locator("span[aria-hidden='true']").first.inner_text()
-                    place["rating"] = float(rating_text.replace(",", "."))
-                except:
-                    place["rating"] = None
-
-                try:
-                    place["address"] = await page.locator("button[data-item-id='address']").inner_text()
-                except:
-                    place["address"] = None
-
-                place["google_maps_url"] = page.url
+                place["name"] = await cards.nth(i).get_attribute("aria-label")
+                place["google_maps_url"] = await cards.nth(i).get_attribute("href")
+                # Можно оставить рейтинг и адрес None — если потребуется, можно искать по новой логике
+                place["rating"] = None
+                place["address"] = None
                 results.append(place)
-
                 logger.info(f"✓ {i+1}/{count}: {place.get('name')}")
-
             except Exception as e:
                 logger.warning(f"Skipped {i+1}: {e}")
 
         await browser.close()
-
     return results
