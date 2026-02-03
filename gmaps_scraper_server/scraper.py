@@ -1,3 +1,5 @@
+print("LOADED SCRAPER.PY FROM:", __file__)
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
