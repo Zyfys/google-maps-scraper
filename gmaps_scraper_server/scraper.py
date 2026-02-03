@@ -1,204 +1,334 @@
-import json
-import asyncio # Changed from time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import time
 import re
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError # Changed to async
-from urllib.parse import urlencode
+import logging
 
-# Import the extraction functions from our helper module
-from . import extractor
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- Constants ---
-BASE_URL = "https://www.google.com/maps/search/"
-DEFAULT_TIMEOUT = 30000  # 30 seconds for navigation and selectors
-SCROLL_PAUSE_TIME = 1.5  # Pause between scrolls
-MAX_SCROLL_ATTEMPTS_WITHOUT_NEW_LINKS = 5 # Stop scrolling if no new links found after this many scrolls
-
-# --- Helper Functions ---
-def create_search_url(query, lang="en", geo_coordinates=None, zoom=None):
-    """Creates a Google Maps search URL."""
-    params = {'q': query, 'hl': lang}
-    # Note: geo_coordinates and zoom might require different URL structure (/maps/@lat,lng,zoom)
-    # For simplicity, starting with basic query search
-    return BASE_URL + "?" + urlencode(params)
-
-# --- Main Scraping Logic ---
-async def scrape_google_maps(query, max_places=None, lang="en", headless=True): # Added async
+def scrape_google_maps(query: str, max_places: int = 20, lang: str = "en", headless: bool = True):
     """
-    Scrapes Google Maps for places based on a query.
-
-    Args:
-        query (str): The search query (e.g., "restaurants in New York").
-        max_places (int, optional): Maximum number of places to scrape. Defaults to None (scrape all found).
-        lang (str, optional): Language code for Google Maps (e.g., 'en', 'es'). Defaults to "en".
-        headless (bool, optional): Whether to run the browser in headless mode. Defaults to True.
-
-    Returns:
-        list: A list of dictionaries, each containing details for a scraped place.
-              Returns an empty list if no places are found or an error occurs.
+    Scrape Google Maps for places based on search query
     """
+    chrome_options = Options()
+    
+    if headless:
+        chrome_options.add_argument("--headless=new")
+    
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument(f"--lang={lang}")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    
     results = []
-    place_links = set()
-    scroll_attempts_no_new = 0
-    browser = None
-
-    async with async_playwright() as p: # Changed to async
+    
+    try:
+        # Формируем URL для поиска
+        search_url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}?hl={lang}"
+        logger.info(f"Navigating to: {search_url}")
+        driver.get(search_url)
+        
+        # Ждем загрузки страницы
+        time.sleep(5)
+        
+        # Пытаемся найти и принять cookies (если появляется)
         try:
-            browser = await p.chromium.launch(
-                headless=headless,
-                args=[
-                    '--disable-dev-shm-usage',  # Use /tmp instead of /dev/shm for shared memory
-                    '--no-sandbox',  # Required for running in Docker
-                    '--disable-setuid-sandbox',
-                ]
-            ) # Added await
-            context = await browser.new_context( # Added await
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                java_script_enabled=True,
-                accept_downloads=False,
-                # Consider setting viewport, locale, timezone if needed
-                locale=lang,
+            consent_button = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Accept') or contains(., 'Reject') or contains(., 'Принять')]"))
             )
-            page = await context.new_page() # Added await
-            if not page:
-                await browser.close() # Close browser before raising
-                raise Exception("Failed to create a new browser page (context.new_page() returned None).")
-            # Removed problematic: await page.set_default_timeout(DEFAULT_TIMEOUT)
-            # Removed associated debug prints
-
-            search_url = create_search_url(query, lang)
-            print(f"Navigating to search URL: {search_url}")
-            await page.goto(search_url, wait_until='domcontentloaded') # Added await
-            await asyncio.sleep(2) # Changed to asyncio.sleep, added await
-
-            # --- Handle potential consent forms ---
-            # This is a common pattern, might need adjustment based on specific consent popups
+            consent_button.click()
+            logger.info("Accepted consent")
+            time.sleep(2)
+        except:
+            logger.info("No consent dialog or already accepted")
+        
+        # Пробуем несколько селекторов для поиска списка результатов
+        feed_selectors = [
+            "div[role='feed']",
+            "div[role='main']",
+            ".m6QErb.DxyBCb.kA9KIf.dS8AEf",
+            "div[aria-label*='Results']",
+            "div.m6QErb"
+        ]
+        
+        scrollable_div = None
+        for selector in feed_selectors:
             try:
-                consent_button_xpath = "//button[.//span[contains(text(), 'Accept all') or contains(text(), 'Reject all')]]"
-                # Wait briefly for the button to potentially appear
-                await page.wait_for_selector(consent_button_xpath, state='visible', timeout=5000) # Added await
-                # Click the "Accept all" or equivalent button if found
-                # Example: Prioritize "Accept all"
-                accept_button = await page.query_selector("//button[.//span[contains(text(), 'Accept all')]]") # Added await
-                if accept_button:
-                    print("Accepting consent form...")
-                    await accept_button.click() # Added await
-                else:
-                    # Fallback to clicking the first consent button found (might be reject)
-                    print("Clicking first available consent button...")
-                    await page.locator(consent_button_xpath).first.click() # Added await
-                # Wait for navigation/popup closure
-                await page.wait_for_load_state('networkidle', timeout=5000) # Added await
-            except PlaywrightTimeoutError:
-                print("No consent form detected or timed out waiting.")
-            except Exception as e:
-                print(f"Error handling consent form: {e}")
-
-
-            # --- Scrolling and Link Extraction ---
-            print("Scrolling to load places...")
-            feed_selector = '[role="feed"]'
+                scrollable_div = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                )
+                logger.info(f"Found feed element with selector: {selector}")
+                break
+            except:
+                continue
+        
+        if not scrollable_div:
+            logger.error("Could not find results container")
+            # Сохраняем скриншот для отладки
+            driver.save_screenshot("/tmp/gmaps_error.png")
+            logger.error("Screenshot saved to /tmp/gmaps_error.png")
+            return results
+        
+        # Прокручиваем для загрузки всех результатов
+        logger.info("Scrolling to load more results...")
+        last_height = driver.execute_script("return arguments[0].scrollHeight", scrollable_div)
+        
+        for scroll_attempt in range(max_places // 10 + 2):
+            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", scrollable_div)
+            time.sleep(2)
+            
+            new_height = driver.execute_script("return arguments[0].scrollHeight", scrollable_div)
+            if new_height == last_height:
+                break
+            last_height = new_height
+        
+        # Ищем элементы мест с разными селекторами
+        place_selectors = [
+            "a[href*='/maps/place/']",
+            "div.Nv2PK a",
+            "a.hfpxzc",
+            "div[role='article'] a"
+        ]
+        
+        places = []
+        for selector in place_selectors:
             try:
-                await page.wait_for_selector(feed_selector, state='visible', timeout=25000) # Added await
-            except PlaywrightTimeoutError:
-                 # Check if it's a single result page (maps/place/)
-                if "/maps/place/" in page.url:
-                    print("Detected single place page.")
-                    place_links.add(page.url)
-                else:
-                    print(f"Error: Feed element '{feed_selector}' not found. Maybe no results or page structure changed.")
-                    await browser.close() # Added await
-                    return [] # No results or page structure changed
-
-            if await page.locator(feed_selector).count() > 0: # Added await
-                last_height = await page.evaluate(f'document.querySelector(\'{feed_selector}\').scrollHeight') # Added await
-                while True:
-                    # Scroll down
-                    await page.evaluate(f'document.querySelector(\'{feed_selector}\').scrollTop = document.querySelector(\'{feed_selector}\').scrollHeight') # Added await
-                    await asyncio.sleep(SCROLL_PAUSE_TIME) # Changed to asyncio.sleep, added await
-
-                    # Extract links after scroll
-                    current_links_list = await page.locator(f'{feed_selector} a[href*="/maps/place/"]').evaluate_all('elements => elements.map(a => a.href)') # Added await
-                    current_links = set(current_links_list)
-                    new_links_found = len(current_links - place_links) > 0
-                    place_links.update(current_links)
-                    print(f"Found {len(place_links)} unique place links so far...")
-
-                    if max_places is not None and len(place_links) >= max_places:
-                        print(f"Reached max_places limit ({max_places}).")
-                        place_links = set(list(place_links)[:max_places]) # Trim excess links
-                        break
-
-                    # Check if scroll height has changed
-                    new_height = await page.evaluate(f'document.querySelector(\'{feed_selector}\').scrollHeight') # Added await
-                    if new_height == last_height:
-                        # Check for the "end of results" marker
-                        end_marker_xpath = "//span[contains(text(), \"You've reached the end of the list.\")]"
-                        if await page.locator(end_marker_xpath).count() > 0: # Added await
-                            print("Reached the end of the results list.")
-                            break
-                        else:
-                            # If height didn't change but end marker isn't there, maybe loading issue?
-                            # Increment no-new-links counter
-                            if not new_links_found:
-                                scroll_attempts_no_new += 1
-                                print(f"Scroll height unchanged and no new links. Attempt {scroll_attempts_no_new}/{MAX_SCROLL_ATTEMPTS_WITHOUT_NEW_LINKS}")
-                                if scroll_attempts_no_new >= MAX_SCROLL_ATTEMPTS_WITHOUT_NEW_LINKS:
-                                    print("Stopping scroll due to lack of new links.")
-                                    break
-                            else:
-                                scroll_attempts_no_new = 0 # Reset if new links were found this cycle
-                    else:
-                        last_height = new_height
-                        scroll_attempts_no_new = 0 # Reset if scroll height changed
-
-                    # Optional: Add a hard limit on scrolls to prevent infinite loops
-                    # if scroll_count > MAX_SCROLLS: break
-
-            # --- Scraping Individual Places ---
-            print(f"\nScraping details for {len(place_links)} places...")
-            count = 0
-            for link in place_links:
-                count += 1
-                print(f"Processing link {count}/{len(place_links)}: {link}") # Keep sync print
+                places = driver.find_elements(By.CSS_SELECTOR, selector)
+                if places:
+                    logger.info(f"Found {len(places)} places with selector: {selector}")
+                    break
+            except:
+                continue
+        
+        if not places:
+            logger.error("No place elements found")
+            driver.save_screenshot("/tmp/gmaps_no_places.png")
+            return results
+        
+        logger.info(f"Processing up to {min(len(places), max_places)} places...")
+        
+        for idx, place in enumerate(places[:max_places]):
+            try:
+                # Кликаем на место
+                driver.execute_script("arguments[0].scrollIntoView(true);", place)
+                time.sleep(1)
+                place.click()
+                time.sleep(3)
+                
+                place_data = {}
+                
+                # Название
                 try:
-                    await page.goto(link, wait_until='domcontentloaded') # Added await
-                    # Wait a bit for dynamic content if needed, or wait for a specific element
-                    # await page.wait_for_load_state('networkidle', timeout=10000) # Or networkidle if needed
-
-                    html_content = await page.content() # Added await
-                    place_data = extractor.extract_place_data(html_content)
-
-                    if place_data:
-                        place_data['link'] = link # Add the source link
-                        results.append(place_data)
-                        # print(json.dumps(place_data, indent=2)) # Optional: print data as it's scraped
+                    name_selectors = ["h1.DUwDvf", "h1", "h2.qBF1Pd"]
+                    for sel in name_selectors:
+                        try:
+                            place_data['name'] = driver.find_element(By.CSS_SELECTOR, sel).text
+                            if place_data['name']:
+                                break
+                        except:
+                            continue
+                    if not place_data.get('name'):
+                        place_data['name'] = "N/A"
+                except:
+                    place_data['name'] = "N/A"
+                
+                # Рейтинг
+                try:
+                    rating_selectors = [
+                        "div.F7nice span[aria-hidden='true']",
+                        "span.ceNzKf[aria-hidden='true']",
+                        "div[jsaction*='rating'] span"
+                    ]
+                    for sel in rating_selectors:
+                        try:
+                            rating_text = driver.find_element(By.CSS_SELECTOR, sel).text
+                            place_data['rating'] = float(rating_text.replace(',', '.'))
+                            break
+                        except:
+                            continue
+                    if 'rating' not in place_data:
+                        place_data['rating'] = None
+                except:
+                    place_data['rating'] = None
+                
+                # Количество отзывов
+                try:
+                    reviews_selectors = [
+                        "div.F7nice span:nth-of-type(2)",
+                        "button[aria-label*='reviews'] span",
+                        "span.RDApEe"
+                    ]
+                    for sel in reviews_selectors:
+                        try:
+                            reviews_text = driver.find_element(By.CSS_SELECTOR, sel).text
+                            reviews_match = re.search(r'[\d,]+', reviews_text.replace(',', ''))
+                            if reviews_match:
+                                place_data['reviews_count'] = int(reviews_match.group())
+                                break
+                        except:
+                            continue
+                    if 'reviews_count' not in place_data:
+                        place_data['reviews_count'] = 0
+                except:
+                    place_data['reviews_count'] = 0
+                
+                # Адрес
+                try:
+                    address_selectors = [
+                        "button[data-item-id='address']",
+                        "button[data-tooltip='Copy address']",
+                        "div.rogA2c div"
+                    ]
+                    for sel in address_selectors:
+                        try:
+                            place_data['address'] = driver.find_element(By.CSS_SELECTOR, sel).get_attribute('aria-label') or \
+                                                   driver.find_element(By.CSS_SELECTOR, sel).text
+                            if place_data['address']:
+                                break
+                        except:
+                            continue
+                    if not place_data.get('address'):
+                        place_data['address'] = "N/A"
+                except:
+                    place_data['address'] = "N/A"
+                
+                # Веб-сайт
+                try:
+                    website_selectors = [
+                        "a[data-item-id='authority']",
+                        "a[href^='http'][data-item-id*='authority']",
+                        "a.CsEnBe[href^='http']"
+                    ]
+                    for sel in website_selectors:
+                        try:
+                            place_data['website'] = driver.find_element(By.CSS_SELECTOR, sel).get_attribute('href')
+                            if place_data['website'] and 'google.com' not in place_data['website']:
+                                break
+                        except:
+                            continue
+                    if not place_data.get('website'):
+                        place_data['website'] = None
+                except:
+                    place_data['website'] = None
+                
+                # Телефон
+                try:
+                    phone_selectors = [
+                        "button[data-item-id*='phone']",
+                        "button[aria-label*='Phone']",
+                        "button.CsEnBe[aria-label*='+']"
+                    ]
+                    for sel in phone_selectors:
+                        try:
+                            phone_elem = driver.find_element(By.CSS_SELECTOR, sel)
+                            place_data['phone'] = phone_elem.get_attribute('aria-label') or phone_elem.text
+                            if place_data['phone']:
+                                # Очищаем от лишнего текста
+                                phone_match = re.search(r'[\d\s\+\-\(\)]+', place_data['phone'])
+                                if phone_match:
+                                    place_data['phone'] = phone_match.group().strip()
+                                break
+                        except:
+                            continue
+                    if not place_data.get('phone'):
+                        place_data['phone'] = None
+                except:
+                    place_data['phone'] = None
+                
+                # URL Google Maps
+                place_data['google_maps_link'] = driver.current_url
+                
+                # Place ID из URL
+                try:
+                    place_id_match = re.search(r'!1s([^!]+)', driver.current_url)
+                    place_data['place_id'] = place_id_match.group(1) if place_id_match else None
+                except:
+                    place_data['place_id'] = None
+                
+                # Координаты из URL
+                try:
+                    coords_match = re.search(r'@(-?\d+\.\d+),(-?\d+\.\d+)', driver.current_url)
+                    if coords_match:
+                        place_data['latitude'] = float(coords_match.group(1))
+                        place_data['longitude'] = float(coords_match.group(2))
                     else:
-                        print(f"  - Failed to extract data for: {link}")
-                        # Optionally save the HTML for debugging
-                        # with open(f"error_page_{count}.html", "w", encoding="utf-8") as f:
-                        #     f.write(html_content)
-
-                except PlaywrightTimeoutError:
-                    print(f"  - Timeout navigating to or processing: {link}")
+                        place_data['latitude'] = None
+                        place_data['longitude'] = None
+                except:
+                    place_data['latitude'] = None
+                    place_data['longitude'] = None
+                
+                # Категории
+                try:
+                    categories_selectors = [
+                        "button[jsaction*='category']",
+                        "button.DkEaL",
+                        "span.YhemCb"
+                    ]
+                    categories = []
+                    for sel in categories_selectors:
+                        try:
+                            cat_elements = driver.find_elements(By.CSS_SELECTOR, sel)
+                            categories = [cat.text for cat in cat_elements if cat.text]
+                            if categories:
+                                break
+                        except:
+                            continue
+                    place_data['categories'] = categories
+                except:
+                    place_data['categories'] = []
+                
+                # Фото (URL первых нескольких фото)
+                try:
+                    photo_urls = []
+                    photo_buttons = driver.find_elements(By.CSS_SELECTOR, "button[aria-label*='Photo']")[:5]
+                    
+                    for photo_btn in photo_buttons:
+                        try:
+                            # Ищем изображение внутри кнопки
+                            img = photo_btn.find_element(By.CSS_SELECTOR, "img")
+                            photo_url = img.get_attribute('src')
+                            
+                            # Преобразуем URL для получения большого размера
+                            if photo_url and 'googleusercontent' in photo_url:
+                                # Убираем параметры размера и добавляем свои
+                                photo_url = re.sub(r'=w\d+-h\d+', '=w1600', photo_url)
+                                photo_urls.append(photo_url)
+                        except:
+                            continue
+                    
+                    place_data['photos'] = photo_urls
+                    place_data['main_photo'] = photo_urls[0] if photo_urls else None
+                    place_data['photos_count'] = len(photo_urls)
                 except Exception as e:
-                    print(f"  - Error processing {link}: {e}")
-                await asyncio.sleep(0.5) # Changed to asyncio.sleep, added await
-
-            await browser.close() # Added await
-
-        except PlaywrightTimeoutError:
-            print(f"Timeout error during scraping process.")
-        except Exception as e:
-            print(f"An error occurred during scraping: {e}")
-            import traceback
-            traceback.print_exc() # Print detailed traceback for debugging
-        finally:
-            # Ensure browser is closed if an error occurred mid-process
-            if browser and browser.is_connected(): # Check if browser exists and is connected
-                await browser.close() # Added await
-
-    print(f"\nScraping finished. Found details for {len(results)} places.")
+                    logger.warning(f"Could not extract photos: {e}")
+                    place_data['photos'] = []
+                    place_data['main_photo'] = None
+                    place_data['photos_count'] = 0
+                
+                results.append(place_data)
+                logger.info(f"✓ Scraped {idx + 1}/{max_places}: {place_data['name']}")
+                
+            except Exception as e:
+                logger.error(f"Error scraping place {idx + 1}: {str(e)}")
+                continue
+        
+    except Exception as e:
+        logger.error(f"Fatal error during scraping: {str(e)}")
+    finally:
+        driver.quit()
+    
     return results
-
-# --- Example Usage ---
-# (Example usage block removed as this script is now intended to be imported as a module)
