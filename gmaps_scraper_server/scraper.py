@@ -22,6 +22,7 @@ async def scrape_google_maps(
                 "--disable-blink-features=AutomationControlled",
             ],
         )
+
         context = await browser.new_context(
             locale=lang,
             user_agent=(
@@ -36,18 +37,19 @@ async def scrape_google_maps(
 
         try:
             await page.goto(search_url, timeout=120000)
-            await page.wait_for_timeout(5000)
+            # Ждем появления feed
+            await page.wait_for_selector("a[aria-label][href*='/maps/place/']", timeout=10000)
         except PlaywrightTimeoutError:
-            logger.error("Page load timeout")
+            logger.error("Page load or selector timeout")
             await browser.close()
             return results
 
         # Прокрутка feed для подгрузки карточек
         try:
-            feed = page.locator("div[role='feed']")
-            for _ in range(max_places // 5 + 3):
+            feed = page.locator("div[role='main']")
+            for _ in range(max_places // 5 + 5):
                 await feed.evaluate("el => el.scrollBy(0, el.scrollHeight)")
-                await page.wait_for_timeout(2000)
+                await asyncio.sleep(2)
         except Exception:
             logger.warning("Feed scroll failed")
 
@@ -59,7 +61,7 @@ async def scrape_google_maps(
         for i in range(count):
             try:
                 await cards.nth(i).click()
-                await page.wait_for_timeout(3000)
+                await asyncio.sleep(3)
 
                 place = {}
 
