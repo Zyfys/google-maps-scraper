@@ -14,8 +14,14 @@ async def scrape_google_maps(
     results = []
 
     async with async_playwright() as p:
+        import os, glob as _glob
+        # Use pre-installed Chromium if Playwright's own build is missing
+        _chrome_paths = _glob.glob("/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome")
+        _exec = _chrome_paths[0] if _chrome_paths else None
+
         browser = await p.chromium.launch(
             headless=headless,
+            executable_path=_exec,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
